@@ -16,17 +16,16 @@ import (
 type natsSession struct {
 	*quickfix.Session
 
-	msgIn  chan quickfix.FixIn
-	msgOut chan []byte
-
 	conn       *nats.Conn
 	inSubject  string
 	outSubject string
 
 	acceptor *Acceptor
 
-	connected bool
-	doConnect sync.Once
+	msgIn       chan quickfix.FixIn
+	msgOut      chan []byte
+	writeLoopWg sync.WaitGroup
+	connected   bool
 }
 
 type Acceptor struct {
@@ -150,9 +149,8 @@ func (a *Acceptor) Stop() {
 	a.logger.InfoContext(context.Background(), "Stopping NATS acceptor")
 
 	// Unsubscribe from all subscriptions and wait for handlers to complete
-	// TODO: Do we want to make "Draining" configurable?
 	for _, sub := range a.subscriptions {
-		if err := sub.Drain(); err != nil {
+		if err := sub.Unsubscribe(); err != nil {
 			a.logger.ErrorContext(context.Background(), "Failed to unsubscribe", "error", err)
 		}
 	}
@@ -168,11 +166,13 @@ func (a *Acceptor) Stop() {
 	}
 	a.sessionGroup.Wait()
 
-	// Drain NATS connection to ensure all messages are sent
+	for sid := range a.sessions {
+		quickfix.UnregisterSession(sid)
+		delete(a.sessions, sid)
+	}
+
 	if a.conn != nil {
-		if err := a.conn.Drain(); err != nil {
-			a.logger.ErrorContext(context.Background(), "Failed to drain NATS connection", "error", err)
-		}
+		a.conn.Close()
 	}
 	a.logger.InfoContext(context.Background(), "NATS acceptor stopped")
 }
@@ -182,26 +182,23 @@ func (a *Acceptor) createSession(sessionID quickfix.SessionID, storeFactory quic
 
 	session, err := a.sessionFactory.CreateSession(sessionID, storeFactory, sessionSettings, logFactory, app)
 	if err != nil {
-		a.logger.ErrorContext(a.ctx, "Failed to create session", "sessionID", sessionID.String(), "error", err)
-		return nil, fmt.Errorf("failed to create session: %w", err)
+		return nil, fmt.Errorf("failed to create quickfix session: %w", err)
 	}
 
 	inTemplate, err := sessionSettings.Setting("NATSInboundSubject")
 	if err != nil {
-		return nil, fmt.Errorf("NATSInboundSubject is required but not configured: %w", err)
+		return nil, err
 	}
 	inSubject := ExpandSubjectTemplate(inTemplate, sessionID)
 
 	outTemplate, err := sessionSettings.Setting("NATSOutboundSubject")
 	if err != nil {
-		return nil, fmt.Errorf("NATSOutboundSubject is required but not configured: %w", err)
+		return nil, err
 	}
 	outSubject := ExpandSubjectTemplate(outTemplate, sessionID)
 
 	ns := &natsSession{
 		Session:    session,
-		msgIn:      make(chan quickfix.FixIn),
-		msgOut:     make(chan []byte),
 		inSubject:  inSubject,
 		outSubject: outSubject,
 		acceptor:   a,
@@ -217,24 +214,38 @@ func (ns *natsSession) handleMessage(natsMsg *nats.Msg) {
 		}
 	}()
 
-	ns.doConnect.Do(func() {
-		if err := ns.Session.Connect(ns.msgIn, ns.msgOut); err != nil {
-			ns.acceptor.logger.ErrorContext(ns.acceptor.ctx, "Failed to connect session", "error", err)
+	// Unlike QuickFIX over TCP, we can't just leave the session disconnected because the client
+	// has no way to reconnect. Instead, we'll watch for the next message from the subject and attempt to reconnect.
+	for {
+		if !ns.connected {
+			ns.msgIn = make(chan quickfix.FixIn)
+			ns.msgOut = make(chan []byte)
+			if err := ns.Session.Connect(ns.msgIn, ns.msgOut); err != nil {
+				ns.acceptor.logger.ErrorContext(ns.acceptor.ctx, "Failed to connect session", "error", err)
+				return
+			}
+			ns.writeLoopWg.Add(1)
+			go func() {
+				defer ns.writeLoopWg.Done()
+				ns.writeLoop()
+			}()
+			ns.connected = true
+		}
+
+		// Check the state of session before attempting to send message
+		// If the session is disconnected, loop to reconnect
+		// If we successfully send the message, return out of the handler to wait for the next message
+		select {
+		case <-ns.Session.DisconnectedC():
+			ns.connected = false
+			close(ns.msgIn)
+			ns.writeLoopWg.Wait()
+			continue
+		case ns.msgIn <- quickfix.NewFixIn(bytes.NewBuffer(natsMsg.Data), time.Now()):
+			ns.acceptor.logger.InfoContext(ns.acceptor.ctx, "Received message", "subject", natsMsg.Subject, "length", len(natsMsg.Data))
 			return
 		}
-		ns.connected = true
-
-		ns.acceptor.sessionGroup.Add(1)
-		go func() {
-			defer ns.acceptor.sessionGroup.Done()
-			ns.writeLoop()
-		}()
-	})
-	if !ns.connected {
-		ns.acceptor.logger.WarnContext(ns.acceptor.ctx, "Received message for disconnected session", "subject", natsMsg.Subject)
-		return
 	}
-	ns.msgIn <- quickfix.NewFixIn(bytes.NewBuffer(natsMsg.Data), time.Now())
 }
 
 func (ns *natsSession) writeLoop() {

@@ -15,6 +15,7 @@ target/
 *.o
 *.so
 *.dylib
+__debug_bin*
 
 # Logs
 logs/
