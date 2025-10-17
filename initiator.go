@@ -48,14 +48,13 @@ type Initiator struct {
 }
 
 func NewInitiator(
-	ctx context.Context,
 	app quickfix.Application,
 	storeFactory quickfix.MessageStoreFactory,
 	settings *quickfix.Settings,
 	logFactory quickfix.LogFactory,
 	logger *slog.Logger,
 ) (*Initiator, error) {
-	ctx, cancel := context.WithCancel(ctx)
+	ctx, cancel := context.WithCancel(context.Background())
 
 	i := &Initiator{
 		sessionFactory: quickfix.SessionFactory{BuildInitiators: true},
@@ -95,7 +94,7 @@ func NewInitiator(
 		seenSubjects[session.outSubject] = sessionID
 
 		i.sessions[sessionID] = session
-		logger.InfoContext(ctx, "Pre-initialized session", "sessionID", sessionID.String(), "inSubject", session.inSubject, "outSubject", session.outSubject)
+		logger.Info("Pre-initialized session", "sessionID", sessionID.String(), "inSubject", session.inSubject, "outSubject", session.outSubject)
 	}
 
 	return i, nil
@@ -129,7 +128,7 @@ func (i *Initiator) Start() error {
 		}()
 
 		is := i.sessions[sessionID]
-		i.logger.InfoContext(i.ctx, "Subscribing to initiator session", "sessionID", sessionID.String(), "subject", is.inSubject)
+		i.logger.Info("Subscribing to initiator session", "sessionID", sessionID.String(), "subject", is.inSubject)
 		sub, err := i.conn.Subscribe(session.inSubject, is.handleMessage)
 		if err != nil {
 			return fmt.Errorf("failed to subscribe to %s: %w", session.inSubject, err)
@@ -137,7 +136,7 @@ func (i *Initiator) Start() error {
 
 		i.subscriptionGroup.Add(1)
 		sub.SetClosedHandler(func(subject string) {
-			i.logger.InfoContext(context.Background(), "Subscription closed", "subject", subject)
+			i.logger.Info("Subscription closed", "subject", subject)
 			i.subscriptionGroup.Done()
 		})
 		i.subscriptions = append(i.subscriptions, sub)
@@ -153,16 +152,7 @@ func (i *Initiator) Start() error {
 }
 
 func (i *Initiator) Stop() {
-	i.logger.InfoContext(context.Background(), "Stopping NATS initiator")
-
-	// Unsubscribe from all subscriptions and wait for handlers to complete
-	for _, sub := range i.subscriptions {
-		if err := sub.Unsubscribe(); err != nil {
-			i.logger.ErrorContext(context.Background(), "Failed to unsubscribe", "error", err)
-		}
-	}
-	i.subscriptionGroup.Wait()
-	i.logger.InfoContext(context.Background(), "All subscriptions closed")
+	i.logger.Info("Stopping NATS initiator")
 
 	// Cancel context and close sessions
 	i.cancel()
@@ -178,14 +168,23 @@ func (i *Initiator) Stop() {
 		delete(i.sessions, sid)
 	}
 
+	// Unsubscribe from all subscriptions and wait for handlers to complete
+	for _, sub := range i.subscriptions {
+		if err := sub.Unsubscribe(); err != nil {
+			i.logger.Error("Failed to unsubscribe", "error", err)
+		}
+	}
+	i.subscriptionGroup.Wait()
+	i.logger.Info("All subscriptions closed")
+
 	if i.conn != nil {
 		i.conn.Close()
 	}
-	i.logger.InfoContext(context.Background(), "NATS initiator stopped")
+	i.logger.Info("NATS initiator stopped")
 }
 
 func (i *Initiator) createSession(sessionID quickfix.SessionID, storeFactory quickfix.MessageStoreFactory, sessionSettings *quickfix.SessionSettings, logFactory quickfix.LogFactory, app quickfix.Application) (*natsInitiatorSession, error) {
-	i.logger.InfoContext(i.ctx, "Creating session", "sessionID", sessionID.String())
+	i.logger.Info("Creating session", "sessionID", sessionID.String())
 
 	session, err := i.sessionFactory.CreateSession(sessionID, storeFactory, sessionSettings, logFactory, app)
 	if err != nil {
@@ -221,15 +220,15 @@ func (is *natsInitiatorSession) connectLoop() {
 		}
 	}()
 
+	is.msgIn = make(chan quickfix.FixIn)
 	for {
 		if !is.waitForInSessionTime() {
 			return
 		}
 
-		is.msgIn = make(chan quickfix.FixIn)
 		is.msgOut = make(chan []byte)
 		if err := is.Session.Connect(is.msgIn, is.msgOut); err != nil {
-			is.initiator.logger.ErrorContext(is.initiator.ctx, "Failed to connect session", "error", err)
+			is.initiator.logger.Error("Failed to connect session", "error", err)
 			return
 		}
 		is.writeLoopWg.Add(1)
@@ -241,11 +240,10 @@ func (is *natsInitiatorSession) connectLoop() {
 
 		select {
 		case <-is.initiator.ctx.Done():
+			close(is.msgIn)
 			return
 		case <-is.Session.DisconnectedC():
 		}
-		is.connected.Store(false)
-		close(is.msgIn)
 		is.writeLoopWg.Wait()
 		is.Session.OnEventf("Reconnecting in %v", is.Session.ReconnectInterval)
 		if !is.waitForReconnectInterval(is.Session.ReconnectInterval) {
@@ -262,16 +260,15 @@ func (is *natsInitiatorSession) handleMessage(natsMsg *nats.Msg) {
 	}()
 
 	if !is.connected.Load() {
-		is.initiator.logger.WarnContext(is.initiator.ctx, "Received message but session is not connected", "subject", natsMsg.Subject)
+		is.initiator.logger.Warn("Received message but session is not connected", "subject", natsMsg.Subject)
 		return
 	}
 
 	select {
-	case <-is.Session.DisconnectedC():
-		is.initiator.logger.WarnContext(is.initiator.ctx, "Received message but session is disconnected", "subject", natsMsg.Subject)
+	case <-is.initiator.ctx.Done():
 		return
 	case is.msgIn <- quickfix.NewFixIn(bytes.NewBuffer(natsMsg.Data), time.Now()):
-		is.initiator.logger.InfoContext(is.initiator.ctx, "Received message", "subject", natsMsg.Subject, "length", len(natsMsg.Data))
+		is.initiator.logger.Info("Received message", "subject", natsMsg.Subject, "length", len(natsMsg.Data))
 	}
 }
 
@@ -307,7 +304,7 @@ func (is *natsInitiatorSession) writeLoop() {
 		if !ok {
 			return
 		}
-		is.initiator.logger.InfoContext(is.initiator.ctx, "Sending message", "subject", is.outSubject, "length", len(msg))
+		is.initiator.logger.Info("Sending message", "subject", is.outSubject, "length", len(msg))
 		if err := is.conn.Publish(is.outSubject, msg); err != nil {
 			is.initiator.globalLog.OnEvent(err.Error())
 		}

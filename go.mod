@@ -21,4 +21,5 @@ require (
 	golang.org/x/sys v0.32.0 // indirect
 )
 
-replace github.com/quickfixgo/quickfix => ../quickfix
+// replace github.com/quickfixgo/quickfix => ../quickfix
+replace github.com/quickfixgo/quickfix => github.com/peak6-labs/quickfix v0.0.0-20251017004012-d18c80daad80

@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"context"
 	"fmt"
 	"log/slog"
 	"os"
@@ -91,13 +90,11 @@ func main() {
 	sessionSettings.Set(natsfixconfig.NATSOutboundSubject, "fix.{BeginString}.{SenderCompID}.{TargetCompID}")
 	settings.AddSession(sessionSettings)
 
-	ctx := context.Background()
 	app := Application{log: logger.With("component", "Application")}
 	storeFactory := quickfix.NewMemoryStoreFactory()
 	logFactory := screen.NewLogFactory()
 
 	initiator, err := natsfix.NewInitiator(
-		ctx,
 		app,
 		storeFactory,
 		settings,

@@ -1,11 +1,12 @@
 package main
 
 import (
-	"context"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/nats-io/nats.go"
 	"github.com/peak6-labs/natsfix"
@@ -52,7 +53,63 @@ func (a Application) FromAdmin(message *quickfix.Message, sessionID quickfix.Ses
 func (a Application) FromApp(message *quickfix.Message, sessionID quickfix.SessionID) quickfix.MessageRejectError {
 	msgType, _ := message.Header.GetString(35)
 	a.log.Info("FromApp", "sessionID", sessionID.String(), "msgType", msgType)
+
+	if msgType == "D" {
+		if err := a.handleNewOrderSingle(message, sessionID); err != nil {
+			a.log.Error("Failed to handle NewOrderSingle", "error", err)
+		}
+	}
+
 	return nil
+}
+
+func (a Application) handleNewOrderSingle(nos *quickfix.Message, sessionID quickfix.SessionID) error {
+	clOrdID, err := nos.Body.GetString(11)
+	if err != nil {
+		return fmt.Errorf("missing ClOrdID: %w", err)
+	}
+
+	symbol, err := nos.Body.GetString(55)
+	if err != nil {
+		return fmt.Errorf("missing Symbol: %w", err)
+	}
+
+	side, err := nos.Body.GetString(54)
+	if err != nil {
+		return fmt.Errorf("missing Side: %w", err)
+	}
+
+	orderQty, err := nos.Body.GetString(38)
+	if err != nil {
+		return fmt.Errorf("missing OrderQty: %w", err)
+	}
+
+	price := ""
+	if p, err := nos.Body.GetString(44); err == nil {
+		price = p
+	}
+
+	execReport := quickfix.NewMessage()
+	execReport.Header.SetField(quickfix.Tag(35), quickfix.FIXString("8"))
+
+	execReport.Body.SetField(quickfix.Tag(11), quickfix.FIXString(clOrdID))
+	execReport.Body.SetField(quickfix.Tag(37), quickfix.FIXString(fmt.Sprintf("ORD-%d", time.Now().UnixNano())))
+	execReport.Body.SetField(quickfix.Tag(17), quickfix.FIXString(fmt.Sprintf("EXEC-%d", time.Now().UnixNano())))
+	execReport.Body.SetField(quickfix.Tag(150), quickfix.FIXString("0"))
+	execReport.Body.SetField(quickfix.Tag(39), quickfix.FIXString("0"))
+	execReport.Body.SetField(quickfix.Tag(55), quickfix.FIXString(symbol))
+	execReport.Body.SetField(quickfix.Tag(54), quickfix.FIXString(side))
+	execReport.Body.SetField(quickfix.Tag(38), quickfix.FIXString(orderQty))
+	execReport.Body.SetField(quickfix.Tag(32), quickfix.FIXString("0"))
+	execReport.Body.SetField(quickfix.Tag(151), quickfix.FIXString(orderQty))
+	execReport.Body.SetField(quickfix.Tag(14), quickfix.FIXString("0"))
+	if price != "" {
+		execReport.Body.SetField(quickfix.Tag(44), quickfix.FIXString(price))
+	}
+	execReport.Body.SetField(quickfix.Tag(60), quickfix.FIXString(time.Now().UTC().Format("20060102-15:04:05.000")))
+
+	a.log.Info("Sending ExecutionReport", "clOrdID", clOrdID, "symbol", symbol)
+	return quickfix.SendToTarget(execReport, sessionID)
 }
 
 func main() {
@@ -86,13 +143,11 @@ func main() {
 	sessionSettings.Set(natsfixconfig.NATSOutboundSubject, "fix.{BeginString}.{SenderCompID}.{TargetCompID}")
 	settings.AddSession(sessionSettings)
 
-	ctx := context.Background()
 	app := Application{log: logger.With("component", "Application")}
 	storeFactory := quickfix.NewMemoryStoreFactory()
 	logFactory := screen.NewLogFactory()
 
 	acceptor, err := natsfix.NewAcceptor(
-		ctx,
 		app,
 		storeFactory,
 		settings,

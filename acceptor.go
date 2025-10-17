@@ -2,7 +2,6 @@ package natsfix
 
 import (
 	"bytes"
-	"context"
 	"fmt"
 	"log/slog"
 	"runtime/debug"
@@ -41,34 +40,25 @@ type Acceptor struct {
 	sessionGroup      sync.WaitGroup
 	subscriptions     []*nats.Subscription
 	subscriptionGroup sync.WaitGroup
-
-	ctx    context.Context
-	cancel context.CancelFunc
 }
 
 func NewAcceptor(
-	ctx context.Context,
 	app quickfix.Application,
 	storeFactory quickfix.MessageStoreFactory,
 	settings *quickfix.Settings,
 	logFactory quickfix.LogFactory,
 	logger *slog.Logger,
 ) (*Acceptor, error) {
-	ctx, cancel := context.WithCancel(ctx)
-
 	a := &Acceptor{
 		sessionFactory: quickfix.SessionFactory{BuildInitiators: false},
 		app:            app,
 		settings:       settings,
 		logger:         logger,
 		sessions:       make(map[quickfix.SessionID]*natsAcceptorSession),
-		ctx:            ctx,
-		cancel:         cancel,
 	}
 
 	var err error
 	if a.globalLog, err = logFactory.Create(); err != nil {
-		cancel()
 		return nil, fmt.Errorf("failed to create global log: %w", err)
 	}
 
@@ -77,24 +67,21 @@ func NewAcceptor(
 	for sessionID, sessionSettings := range settings.SessionSettings() {
 		session, err := a.createSession(sessionID, storeFactory, sessionSettings, logFactory, app)
 		if err != nil {
-			cancel()
 			return nil, fmt.Errorf("failed to create session %s: %w", sessionID.String(), err)
 		}
 
 		if existingSessionID, exists := seenSubjects[session.inSubject]; exists {
-			cancel()
 			return nil, fmt.Errorf("duplicate subject %s: inbound for session %s conflicts with session %s", session.inSubject, sessionID.String(), existingSessionID.String())
 		}
 		seenSubjects[session.inSubject] = sessionID
 
 		if existingSessionID, exists := seenSubjects[session.outSubject]; exists {
-			cancel()
 			return nil, fmt.Errorf("duplicate subject %s: outbound for session %s conflicts with session %s", session.outSubject, sessionID.String(), existingSessionID.String())
 		}
 		seenSubjects[session.outSubject] = sessionID
 
 		a.sessions[sessionID] = session
-		logger.InfoContext(ctx, "Pre-initialized session", "sessionID", sessionID.String(), "inSubject", session.inSubject, "outSubject", session.outSubject)
+		logger.Info("Pre-initialized session", "sessionID", sessionID.String(), "inSubject", session.inSubject, "outSubject", session.outSubject)
 	}
 
 	return a, nil
@@ -128,7 +115,7 @@ func (a *Acceptor) Start() error {
 		}()
 
 		ns := a.sessions[sessionID]
-		a.logger.InfoContext(a.ctx, "Subscribing to configured session", "sessionID", sessionID.String(), "subject", ns.inSubject)
+		a.logger.Info("Subscribing to configured session", "sessionID", sessionID.String(), "subject", ns.inSubject)
 		sub, err := a.conn.Subscribe(session.inSubject, ns.handleMessage)
 		if err != nil {
 			return fmt.Errorf("failed to subscribe to %s: %w", session.inSubject, err)
@@ -136,7 +123,7 @@ func (a *Acceptor) Start() error {
 
 		a.subscriptionGroup.Add(1)
 		sub.SetClosedHandler(func(subject string) {
-			a.logger.InfoContext(context.Background(), "Subscription closed", "subject", subject)
+			a.logger.Info("Subscription closed", "subject", subject)
 			a.subscriptionGroup.Done()
 		})
 		a.subscriptions = append(a.subscriptions, sub)
@@ -146,40 +133,39 @@ func (a *Acceptor) Start() error {
 }
 
 func (a *Acceptor) Stop() {
-	a.logger.InfoContext(context.Background(), "Stopping NATS acceptor")
-
-	// Unsubscribe from all subscriptions and wait for handlers to complete
-	for _, sub := range a.subscriptions {
-		if err := sub.Unsubscribe(); err != nil {
-			a.logger.ErrorContext(context.Background(), "Failed to unsubscribe", "error", err)
-		}
-	}
-	a.subscriptionGroup.Wait()
-	a.logger.InfoContext(context.Background(), "All subscriptions closed")
+	a.logger.Info("Stopping NATS acceptor")
 
 	// Cancel context and close sessions
-	a.cancel()
 	for _, s := range a.sessions {
 		if s != nil {
 			s.Close()
 		}
 	}
 	a.sessionGroup.Wait()
-	a.logger.InfoContext(context.Background(), "All sessions stopped")
+	a.logger.Info("All sessions stopped")
 
 	for sid := range a.sessions {
 		quickfix.UnregisterSession(sid)
 		delete(a.sessions, sid)
 	}
 
+	// Unsubscribe from all subscriptions and wait for handlers to complete
+	for _, sub := range a.subscriptions {
+		if err := sub.Unsubscribe(); err != nil {
+			a.logger.Error("Failed to unsubscribe", "error", err)
+		}
+	}
+	a.subscriptionGroup.Wait()
+	a.logger.Info("All subscriptions closed")
+
 	if a.conn != nil {
 		a.conn.Close()
 	}
-	a.logger.InfoContext(context.Background(), "NATS acceptor stopped")
+	a.logger.Info("NATS acceptor stopped")
 }
 
 func (a *Acceptor) createSession(sessionID quickfix.SessionID, storeFactory quickfix.MessageStoreFactory, sessionSettings *quickfix.SessionSettings, logFactory quickfix.LogFactory, app quickfix.Application) (*natsAcceptorSession, error) {
-	a.logger.InfoContext(a.ctx, "Creating session", "sessionID", sessionID.String())
+	a.logger.Info("Creating session", "sessionID", sessionID.String())
 
 	session, err := a.sessionFactory.CreateSession(sessionID, storeFactory, sessionSettings, logFactory, app)
 	if err != nil {
@@ -203,6 +189,7 @@ func (a *Acceptor) createSession(sessionID quickfix.SessionID, storeFactory quic
 		inSubject:  inSubject,
 		outSubject: outSubject,
 		acceptor:   a,
+		msgIn:      make(chan quickfix.FixIn),
 	}
 
 	return ns, nil
@@ -219,10 +206,9 @@ func (ns *natsAcceptorSession) handleMessage(natsMsg *nats.Msg) {
 	// has no way to reconnect. Instead, we'll watch for the next message from the subject and attempt to reconnect.
 	for {
 		if !ns.connected {
-			ns.msgIn = make(chan quickfix.FixIn)
 			ns.msgOut = make(chan []byte)
 			if err := ns.Session.Connect(ns.msgIn, ns.msgOut); err != nil {
-				ns.acceptor.logger.ErrorContext(ns.acceptor.ctx, "Failed to connect session", "error", err)
+				ns.acceptor.logger.Error("Failed to connect session", "error", err)
 				return
 			}
 			ns.writeLoopWg.Add(1)
@@ -239,11 +225,10 @@ func (ns *natsAcceptorSession) handleMessage(natsMsg *nats.Msg) {
 		select {
 		case <-ns.Session.DisconnectedC():
 			ns.connected = false
-			close(ns.msgIn)
 			ns.writeLoopWg.Wait()
 			continue
 		case ns.msgIn <- quickfix.NewFixIn(bytes.NewBuffer(natsMsg.Data), time.Now()):
-			ns.acceptor.logger.InfoContext(ns.acceptor.ctx, "Received message", "subject", natsMsg.Subject, "length", len(natsMsg.Data))
+			ns.acceptor.logger.Info("Received message", "subject", natsMsg.Subject, "length", len(natsMsg.Data))
 			return
 		}
 	}
