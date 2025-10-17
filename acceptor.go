@@ -13,7 +13,7 @@ import (
 	"github.com/quickfixgo/quickfix"
 )
 
-type natsSession struct {
+type natsAcceptorSession struct {
 	*quickfix.Session
 
 	conn       *nats.Conn
@@ -37,7 +37,7 @@ type Acceptor struct {
 
 	conn              *nats.Conn
 	logger            *slog.Logger
-	sessions          map[quickfix.SessionID]*natsSession
+	sessions          map[quickfix.SessionID]*natsAcceptorSession
 	sessionGroup      sync.WaitGroup
 	subscriptions     []*nats.Subscription
 	subscriptionGroup sync.WaitGroup
@@ -61,7 +61,7 @@ func NewAcceptor(
 		app:            app,
 		settings:       settings,
 		logger:         logger,
-		sessions:       make(map[quickfix.SessionID]*natsSession),
+		sessions:       make(map[quickfix.SessionID]*natsAcceptorSession),
 		ctx:            ctx,
 		cancel:         cancel,
 	}
@@ -165,6 +165,7 @@ func (a *Acceptor) Stop() {
 		}
 	}
 	a.sessionGroup.Wait()
+	a.logger.InfoContext(context.Background(), "All sessions stopped")
 
 	for sid := range a.sessions {
 		quickfix.UnregisterSession(sid)
@@ -177,7 +178,7 @@ func (a *Acceptor) Stop() {
 	a.logger.InfoContext(context.Background(), "NATS acceptor stopped")
 }
 
-func (a *Acceptor) createSession(sessionID quickfix.SessionID, storeFactory quickfix.MessageStoreFactory, sessionSettings *quickfix.SessionSettings, logFactory quickfix.LogFactory, app quickfix.Application) (*natsSession, error) {
+func (a *Acceptor) createSession(sessionID quickfix.SessionID, storeFactory quickfix.MessageStoreFactory, sessionSettings *quickfix.SessionSettings, logFactory quickfix.LogFactory, app quickfix.Application) (*natsAcceptorSession, error) {
 	a.logger.InfoContext(a.ctx, "Creating session", "sessionID", sessionID.String())
 
 	session, err := a.sessionFactory.CreateSession(sessionID, storeFactory, sessionSettings, logFactory, app)
@@ -197,7 +198,7 @@ func (a *Acceptor) createSession(sessionID quickfix.SessionID, storeFactory quic
 	}
 	outSubject := ExpandSubjectTemplate(outTemplate, sessionID)
 
-	ns := &natsSession{
+	ns := &natsAcceptorSession{
 		Session:    session,
 		inSubject:  inSubject,
 		outSubject: outSubject,
@@ -207,7 +208,7 @@ func (a *Acceptor) createSession(sessionID quickfix.SessionID, storeFactory quic
 	return ns, nil
 }
 
-func (ns *natsSession) handleMessage(natsMsg *nats.Msg) {
+func (ns *natsAcceptorSession) handleMessage(natsMsg *nats.Msg) {
 	defer func() {
 		if err := recover(); err != nil {
 			ns.acceptor.globalLog.OnEventf("Message handling panic: %s", debug.Stack())
@@ -248,18 +249,14 @@ func (ns *natsSession) handleMessage(natsMsg *nats.Msg) {
 	}
 }
 
-func (ns *natsSession) writeLoop() {
+func (ns *natsAcceptorSession) writeLoop() {
 	for {
-		select {
-		case <-ns.acceptor.ctx.Done():
+		msg, ok := <-ns.msgOut
+		if !ok {
 			return
-		case msg, ok := <-ns.msgOut:
-			if !ok {
-				return
-			}
-			if err := ns.conn.Publish(ns.outSubject, msg); err != nil {
-				ns.acceptor.globalLog.OnEvent(err.Error())
-			}
+		}
+		if err := ns.conn.Publish(ns.outSubject, msg); err != nil {
+			ns.acceptor.globalLog.OnEvent(err.Error())
 		}
 	}
 }

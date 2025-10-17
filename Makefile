@@ -21,6 +21,10 @@ acceptor:
 	mkdir -p bin
 	go build -o bin/acceptor ./examples/acceptor
 
+initiator:
+	mkdir -p bin
+	go build -o bin/initiator ./examples/initiator
+
 fmt:
 	go fmt ./...
 
