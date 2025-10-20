@@ -268,7 +268,6 @@ func (is *natsInitiatorSession) handleMessage(natsMsg *nats.Msg) {
 	case <-is.initiator.ctx.Done():
 		return
 	case is.msgIn <- quickfix.NewFixIn(bytes.NewBuffer(natsMsg.Data), time.Now()):
-		is.initiator.logger.Info("Received message", "subject", natsMsg.Subject, "length", len(natsMsg.Data))
 	}
 }
 
@@ -304,7 +303,6 @@ func (is *natsInitiatorSession) writeLoop() {
 		if !ok {
 			return
 		}
-		is.initiator.logger.Info("Sending message", "subject", is.outSubject, "length", len(msg))
 		if err := is.conn.Publish(is.outSubject, msg); err != nil {
 			is.initiator.globalLog.OnEvent(err.Error())
 		}
