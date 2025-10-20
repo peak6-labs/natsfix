@@ -22,4 +22,4 @@ require (
 )
 
 // replace github.com/quickfixgo/quickfix => ../quickfix
-replace github.com/quickfixgo/quickfix => github.com/peak6-labs/quickfix v0.0.0-20251017004012-d18c80daad80
+replace github.com/quickfixgo/quickfix => github.com/peak6-labs/quickfix v0.0.0-20251020175815-1080c6e7ae43
