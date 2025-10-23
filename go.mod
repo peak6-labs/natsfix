@@ -1,6 +1,9 @@
 module github.com/peak6-labs/natsfix
 
-go 1.25.0
+go 1.24
+
+// replace github.com/quickfixgo/quickfix => ../quickfix
+replace github.com/quickfixgo/quickfix => github.com/peak6-labs/quickfix v0.0.0-20251020175815-1080c6e7ae43
 
 require (
 	github.com/nats-io/nats.go v1.47.0
@@ -20,6 +23,3 @@ require (
 	golang.org/x/net v0.24.0 // indirect
 	golang.org/x/sys v0.32.0 // indirect
 )
-
-// replace github.com/quickfixgo/quickfix => ../quickfix
-replace github.com/quickfixgo/quickfix => github.com/peak6-labs/quickfix v0.0.0-20251020175815-1080c6e7ae43
