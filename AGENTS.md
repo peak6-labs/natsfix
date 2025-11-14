@@ -14,7 +14,6 @@ This is a **NATS-based transport layer for FIX protocol (FIXT.1.1)** that integr
 
 **Key components**:
 - `acceptor.go`: NATSAcceptor manages NATS connections, subscriptions, and session lifecycle
-- `settings.go`: FIXT.1.1 settings helpers and validation
 - `subject.go`: NATS subject template expansion with SessionID placeholders
 - `examples/`: Example usage implementations
 
