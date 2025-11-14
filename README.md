@@ -43,17 +43,21 @@ The acceptor passively waits for incoming FIX messages and reconnects sessions o
 
 ```go
 import (
+    "github.com/nats-io/nats.go"
     natsfix "github.com/peak6-labs/natsfix"
+    natsfixconfig "github.com/peak6-labs/natsfix/config"
     "github.com/quickfixgo/quickfix"
 )
 
+// Connect to NATS (optional - can use settings instead)
+nc, err := nats.Connect("nats://localhost:4222")
+if err != nil {
+    log.Fatal(err)
+}
+defer nc.Close()
+
 // Create FIXT.1.1 settings
 settings := natsfix.CreateFIXTSettings("GATEWAY", "CLIENT1")
-
-// Configure NATS connection
-globalSettings := settings.GlobalSettings()
-globalSettings.Set("NATSUrl", "nats://localhost:4222")
-// Optional: globalSettings.Set("NATSCredsFile", "/path/to/creds.file")
 
 // Configure NATS subjects for the session
 sessionID := quickfix.SessionID{
@@ -62,8 +66,8 @@ sessionID := quickfix.SessionID{
     TargetCompID: "CLIENT1",
 }
 sessionSettings := settings.SessionSettings()[sessionID]
-sessionSettings.Set("NATSInboundSubject", "fix.{BeginString}.{TargetCompID}.{SenderCompID}.msgs")
-sessionSettings.Set("NATSOutboundSubject", "fix.{BeginString}.{SenderCompID}.{TargetCompID}.msgs")
+sessionSettings.Set(natsfixconfig.NATSInboundSubject, "fix.{BeginString}.{TargetCompID}.{SenderCompID}.msgs")
+sessionSettings.Set(natsfixconfig.NATSOutboundSubject, "fix.{BeginString}.{SenderCompID}.{TargetCompID}.msgs")
 
 // Create acceptor
 acceptor, err := natsfix.NewAcceptor(
@@ -72,6 +76,7 @@ acceptor, err := natsfix.NewAcceptor(
     settings,
     quickfix.NewScreenLogFactory(),
     logger,                             // *slog.Logger
+    natsfix.WithAcceptorConn(nc),       // optional: provide NATS connection
 )
 if err != nil {
     log.Fatal(err)
@@ -90,17 +95,21 @@ The initiator actively connects to the counterparty, waits for session time, and
 
 ```go
 import (
+    "github.com/nats-io/nats.go"
     natsfix "github.com/peak6-labs/natsfix"
+    natsfixconfig "github.com/peak6-labs/natsfix/config"
     "github.com/quickfixgo/quickfix"
 )
 
+// Connect to NATS (optional - can use settings instead)
+nc, err := nats.Connect("nats://localhost:4222")
+if err != nil {
+    log.Fatal(err)
+}
+defer nc.Close()
+
 // Create FIXT.1.1 settings
 settings := natsfix.CreateFIXTSettings("CLIENT1", "GATEWAY")
-
-// Configure NATS connection
-globalSettings := settings.GlobalSettings()
-globalSettings.Set("NATSUrl", "nats://localhost:4222")
-// Optional: globalSettings.Set("NATSCredsFile", "/path/to/creds.file")
 
 // Configure NATS subjects for the session
 sessionID := quickfix.SessionID{
@@ -109,8 +118,8 @@ sessionID := quickfix.SessionID{
     TargetCompID: "GATEWAY",
 }
 sessionSettings := settings.SessionSettings()[sessionID]
-sessionSettings.Set("NATSInboundSubject", "fix.{BeginString}.{TargetCompID}.{SenderCompID}.msgs")
-sessionSettings.Set("NATSOutboundSubject", "fix.{BeginString}.{SenderCompID}.{TargetCompID}.msgs")
+sessionSettings.Set(natsfixconfig.NATSInboundSubject, "fix.{BeginString}.{TargetCompID}.{SenderCompID}.msgs")
+sessionSettings.Set(natsfixconfig.NATSOutboundSubject, "fix.{BeginString}.{SenderCompID}.{TargetCompID}.msgs")
 
 // Create initiator
 initiator, err := natsfix.NewInitiator(
@@ -119,6 +128,7 @@ initiator, err := natsfix.NewInitiator(
     settings,
     quickfix.NewScreenLogFactory(),
     logger,                             // *slog.Logger
+    natsfix.WithInitiatorConn(nc),      // optional: provide NATS connection
 )
 if err != nil {
     log.Fatal(err)
@@ -133,8 +143,28 @@ defer initiator.Stop()
 
 ### Configuration
 
+**NATS Connection:**
+
+You can provide a NATS connection in two ways:
+
+1. **Via functional option (recommended):**
+```go
+nc, _ := nats.Connect("nats://localhost:4222")
+acceptor, err := natsfix.NewAcceptor(app, storeFactory, settings, logFactory, logger,
+    natsfix.WithAcceptorConn(nc))
+```
+
+2. **Via settings (backwards compatible):**
+```go
+globalSettings := settings.GlobalSettings()
+globalSettings.Set(natsfixconfig.NATSUrl, "nats://localhost:4222")
+globalSettings.Set(natsfixconfig.NATSCredsFile, "/path/to/creds.file") // optional
+acceptor, err := natsfix.NewAcceptor(app, storeFactory, settings, logFactory, logger)
+// Connection will be created automatically during Start()
+```
+
 **Global Settings:**
-- `NATSUrl` (required): NATS server URL
+- `NATSUrl` (required if connection not provided): NATS server URL
 - `NATSCredsFile` (optional): Path to NATS credentials file
 
 **Session Settings:**
@@ -163,14 +193,14 @@ Subject tokens are normalized to be NATS-safe (dots, spaces, and wildcards are r
 ### Lifecycle
 
 **Acceptor:**
-- `NewAcceptor()`: Creates acceptor, initializes sessions
-- `Start()`: Connects to NATS, starts subscriptions and session goroutines
+- `NewAcceptor()`: Creates acceptor, initializes sessions. Accepts optional `WithAcceptorConn()` to provide NATS connection.
+- `Start()`: Connects to NATS (if not already provided), starts subscriptions and session goroutines
 - `Stop()`: Unsubscribes, closes sessions, closes NATS connection
 - Automatically reconnects sessions when messages are received
 
 **Initiator:**
-- `NewInitiator()`: Creates initiator, initializes sessions
-- `Start()`: Connects to NATS, starts subscriptions and session goroutines
+- `NewInitiator()`: Creates initiator, initializes sessions. Accepts optional `WithInitiatorConn()` to provide NATS connection.
+- `Start()`: Connects to NATS (if not already provided), starts subscriptions and session goroutines
 - `Stop()`: Cancels context, unsubscribes, closes sessions, closes NATS connection
 - Automatically waits for session time before connecting
 - Automatically reconnects using the configured `ReconnectInterval`
