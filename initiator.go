@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/nats-io/nats.go"
+	"github.com/peak6-labs/natsfix/config"
 	"github.com/quickfixgo/quickfix"
 )
 
@@ -47,12 +48,21 @@ type Initiator struct {
 	cancel context.CancelFunc
 }
 
+type InitiatorOption func(*Initiator)
+
+func WithInitiatorConn(conn *nats.Conn) InitiatorOption {
+	return func(i *Initiator) {
+		i.conn = conn
+	}
+}
+
 func NewInitiator(
 	app quickfix.Application,
 	storeFactory quickfix.MessageStoreFactory,
 	settings *quickfix.Settings,
 	logFactory quickfix.LogFactory,
 	logger *slog.Logger,
+	opts ...InitiatorOption,
 ) (*Initiator, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -64,6 +74,10 @@ func NewInitiator(
 		sessions:       make(map[quickfix.SessionID]*natsInitiatorSession),
 		ctx:            ctx,
 		cancel:         cancel,
+	}
+
+	for _, opt := range opts {
+		opt(i)
 	}
 
 	var err error
@@ -94,32 +108,34 @@ func NewInitiator(
 		seenSubjects[session.outSubject] = sessionID
 
 		i.sessions[sessionID] = session
-		logger.Info("Pre-initialized session", "sessionID", sessionID.String(), "inSubject", session.inSubject, "outSubject", session.outSubject)
+		i.logger.Info("Pre-initialized session", "sessionID", sessionID.String(), "inSubject", session.inSubject, "outSubject", session.outSubject)
 	}
 
 	return i, nil
 }
 
 func (i *Initiator) Start() error {
-	natsURL, err := i.settings.GlobalSettings().Setting("NATSUrl")
-	if err != nil {
-		return fmt.Errorf("NATSUrl not configured in global settings: %w", err)
-	}
+	if i.conn == nil {
+		natsURL, err := i.settings.GlobalSettings().Setting(config.NATSUrl)
+		if err != nil {
+			return fmt.Errorf("NATSUrl not configured in global settings: %w", err)
+		}
 
-	var opts []nats.Option
-	if i.settings.GlobalSettings().HasSetting("NATSCredsFile") {
-		credsFile, _ := i.settings.GlobalSettings().Setting("NATSCredsFile")
-		opts = append(opts, nats.UserCredentials(credsFile))
-	}
+		var opts []nats.Option
+		if i.settings.GlobalSettings().HasSetting(config.NATSCredsFile) {
+			credsFile, _ := i.settings.GlobalSettings().Setting(config.NATSCredsFile)
+			opts = append(opts, nats.UserCredentials(credsFile))
+		}
 
-	conn, err := nats.Connect(natsURL, opts...)
-	if err != nil {
-		return fmt.Errorf("failed to connect to NATS at %s: %w", natsURL, err)
+		conn, err := nats.Connect(natsURL, opts...)
+		if err != nil {
+			return fmt.Errorf("failed to connect to NATS at %s: %w", natsURL, err)
+		}
+		i.conn = conn
 	}
-	i.conn = conn
 
 	for sessionID, session := range i.sessions {
-		session.conn = conn
+		session.conn = i.conn
 
 		i.sessionGroup.Add(1)
 		go func() {
@@ -191,13 +207,13 @@ func (i *Initiator) createSession(sessionID quickfix.SessionID, storeFactory qui
 		return nil, fmt.Errorf("failed to create quickfix session: %w", err)
 	}
 
-	inTemplate, err := sessionSettings.Setting("NATSInboundSubject")
+	inTemplate, err := sessionSettings.Setting(config.NATSInboundSubject)
 	if err != nil {
 		return nil, err
 	}
 	inSubject := ExpandSubjectTemplate(inTemplate, sessionID)
 
-	outTemplate, err := sessionSettings.Setting("NATSOutboundSubject")
+	outTemplate, err := sessionSettings.Setting(config.NATSOutboundSubject)
 	if err != nil {
 		return nil, err
 	}

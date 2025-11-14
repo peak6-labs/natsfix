@@ -122,14 +122,22 @@ func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	slog.SetDefault(logger)
 
+	var natsOpts []nats.Option
+	if *natsCredsFile != "" {
+		natsOpts = append(natsOpts, nats.UserCredentials(*natsCredsFile))
+	}
+
+	nc, err := nats.Connect(*natsURL, natsOpts...)
+	if err != nil {
+		logger.Error("Failed to connect to NATS", "error", err)
+		os.Exit(1)
+	}
+	defer nc.Close()
+
 	settings := quickfix.NewSettings()
 	globalSettings := settings.GlobalSettings()
 	globalSettings.Set(config.BeginString, "FIXT.1.1")
 	globalSettings.Set(config.DefaultApplVerID, "9") // FIX.5.0SP2
-	globalSettings.Set(natsfixconfig.NATSUrl, *natsURL)
-	if *natsCredsFile != "" {
-		globalSettings.Set(natsfixconfig.NATSCredsFile, *natsCredsFile)
-	}
 
 	sessionSettings := quickfix.NewSessionSettings()
 	sessionSettings.Set(config.SenderCompID, *senderCompID)
@@ -153,6 +161,7 @@ func main() {
 		settings,
 		logFactory,
 		logger.With("component", "Acceptor"),
+		natsfix.WithAcceptorConn(nc),
 	)
 	if err != nil {
 		logger.Error("Failed to create acceptor", "error", err)
